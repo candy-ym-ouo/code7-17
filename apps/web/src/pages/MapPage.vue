@@ -3,6 +3,14 @@ import { nextTick, onBeforeUnmount, onMounted, ref } from "vue";
 import { useRouter } from "vue-router";
 import maplibregl from "maplibre-gl";
 import { apiFetch } from "../lib/api";
+import OfflinePanel from "../components/OfflinePanel.vue";
+import { useOfflineStore } from "../stores/offline";
+import {
+  ensureOfflineProtocol,
+  queryCachedFeatures,
+  toOfflineTileUrl,
+  type BBox
+} from "../lib/offline";
 
 type FeatureResult = {
   id: string;
@@ -20,12 +28,15 @@ type FeatureResult = {
 type Category = { key: string; name: string };
 
 const router = useRouter();
+const offline = useOfflineStore();
 const mapElement = ref<HTMLDivElement | null>(null);
 const features = ref<FeatureResult[]>([]);
 const categories = ref<Category[]>([]);
 const selectedCategory = ref("");
 const loading = ref(false);
 const error = ref("");
+const offlineNotice = ref("");
+const viewport = ref<{ bbox: BBox; zoom: number } | null>(null);
 let map: maplibregl.Map | null = null;
 let loaded = false;
 
@@ -57,10 +68,20 @@ function updateSource() {
   source?.setData(featureCollection() as never);
 }
 
+function refreshViewport() {
+  if (!map) return;
+  const bounds = map.getBounds();
+  viewport.value = {
+    bbox: [bounds.getWest(), bounds.getSouth(), bounds.getEast(), bounds.getNorth()],
+    zoom: map.getZoom()
+  };
+}
+
 async function loadFeatures() {
   if (!map) return;
   loading.value = true;
   error.value = "";
+  offlineNotice.value = "";
   const bounds = map.getBounds();
   const center = map.getCenter();
   let west = bounds.getWest();
@@ -85,7 +106,18 @@ async function loadFeatures() {
     features.value = await apiFetch<FeatureResult[]>(`/features?${query}`);
     updateSource();
   } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : "加载地图数据失败";
+    // 网络失败时回退到离线缓存；缓存命中则明确标注，避免把旧数据当成实时数据。
+    const cached = await queryCachedFeatures(
+      [west, south, east, north],
+      selectedCategory.value || undefined
+    ).catch(() => []);
+    if (cached.length) {
+      features.value = cached as FeatureResult[];
+      offlineNotice.value = "网络不可用，当前显示离线缓存数据，恢复联网后将自动同步。";
+      updateSource();
+    } else {
+      error.value = cause instanceof Error ? cause.message : "加载地图数据失败";
+    }
   } finally {
     loading.value = false;
   }
@@ -176,6 +208,7 @@ onMounted(async () => {
   await nextTick();
   categories.value = await apiFetch<Category[]>("/categories").catch(() => []);
   if (!mapElement.value) return;
+  ensureOfflineProtocol();
   map = new maplibregl.Map({
     container: mapElement.value,
     center,
@@ -186,7 +219,7 @@ onMounted(async () => {
       sources: {
         osm: {
           type: "raster",
-          tiles: [tileUrl],
+          tiles: [toOfflineTileUrl(tileUrl)],
           tileSize: 256,
           attribution: "© OpenStreetMap contributors"
         }
@@ -196,8 +229,14 @@ onMounted(async () => {
   });
   map.addControl(new maplibregl.NavigationControl(), "bottom-right");
   map.addControl(new maplibregl.ScaleControl({ unit: "metric" }), "bottom-left");
-  map.on("load", addFeatureLayers);
-  map.on("moveend", () => { if (loaded) void loadFeatures(); });
+  map.on("load", () => {
+    addFeatureLayers();
+    refreshViewport();
+  });
+  map.on("moveend", () => {
+    refreshViewport();
+    if (loaded) void loadFeatures();
+  });
   map.on("error", (event) => { error.value = event.error?.message ?? "地图加载失败"; });
 });
 
@@ -220,6 +259,7 @@ onBeforeUnmount(() => {
     <div class="map-layout">
       <div class="map-panel">
         <div ref="mapElement" class="map-canvas" aria-label="公共空间细节地图"></div>
+        <OfflinePanel :viewport="viewport" />
         <div class="map-toolbar">
           <div class="inline">
             <label for="category-filter" class="muted">分类</label>
@@ -229,6 +269,7 @@ onBeforeUnmount(() => {
             </select>
             <span v-if="loading" class="muted">加载中…</span>
             <span v-else class="muted">{{ features.length }} 个结果</span>
+            <span v-if="!offline.online" class="badge pending">离线</span>
           </div>
         </div>
       </div>
@@ -239,6 +280,7 @@ onBeforeUnmount(() => {
             <strong>当前视野</strong>
             <span class="muted">{{ features.length }} 项</span>
           </div>
+          <p v-if="offlineNotice" class="notice-box">{{ offlineNotice }}</p>
           <p v-if="error" class="error-box">{{ error }}</p>
         </div>
         <div v-if="!features.length && !loading" class="empty">当前视野没有已发布的细节。</div>

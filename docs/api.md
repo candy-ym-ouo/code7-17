@@ -14,6 +14,7 @@
 |---|---|---|
 | `GET` | `/categories` | 分类与详情 schema |
 | `GET` | `/features?bbox=...` | 查询已发布地图要素 |
+| `GET` | `/features/sync?bbox=...&since=...` | 离线缓存增量同步（游标 + 删除集合） |
 | `GET` | `/features/:id` | 已发布详情；作者和审核员可查看私有状态 |
 | `GET` | `/features/:id/comments` | 已发布评论 |
 | `GET` | `/features/:id/confirmations` | 时效确认汇总 |
@@ -88,3 +89,26 @@
 | `POST` | `/moderation/comments/:id/hide` | 隐藏评论 |
 | `POST` | `/moderation/reports/:id/resolve` | 处理举报 |
 | `GET` | `/moderation/audit` | 管理员审计日志 |
+
+## 离线增量同步
+
+`GET /features/sync?bbox=minLon,minLat,maxLon,maxLat&since=<ISO8601>&limit=500`
+
+供前端离线模块在网络恢复后增量同步选区。响应：
+
+```json
+{
+  "serverTime": "2026-09-25T12:00:00.000Z",
+  "hasMore": false,
+  "upserts": [ { "id": "...", "updatedAt": "...", "...": "与 /features 元素结构一致" } ],
+  "deletedIds": ["uuid"]
+}
+```
+
+- 首次同步省略 `since`（等价于 1970），返回选区内全部已发布要素，`deletedIds` 为空。
+- 后续同步把上一次响应的 `serverTime` 作为 `since`；比较为 `>=`，重复记录由客户端按 `updatedAt` 幂等覆盖。
+- `upserts` 为时间窗口内发布、未删除、在选区内的要素。
+- `deletedIds` 覆盖三类客户端需要淘汰的记录：已软删除、已下线（审核隐藏等）、位置已移出选区。所有这些变更都会更新 `updated_at`。
+- `hasMore=true` 表示窗口被截断，`serverTime` 停在最后一条已返回记录的时间，客户端必须携带该值继续翻页，直到 `hasMore=false`。
+- `serverTime` 取自数据库时钟，客户端不得使用本地时钟推进游标，避免时钟偏差丢数据。
+- `bbox` 与 `/features` 相同，单次跨度限制 5 度；大范围选区由客户端按网格分块请求，并将各块游标取最小值。

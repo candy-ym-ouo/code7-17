@@ -2,6 +2,7 @@
 import { computed, onMounted, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { apiFetch } from "../lib/api";
+import { getCachedFeature } from "../lib/offline";
 import { useAuthStore } from "../stores/auth";
 
 type Feature = {
@@ -74,7 +75,14 @@ async function load() {
     feature.value = await apiFetch<Feature>(`/features/${id}`);
     comments.value = await apiFetch<Comment[]>(`/features/${id}/comments`);
   } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : "加载失败";
+    // 网络失败时回退到离线缓存的详情，并明确标注数据可能不是最新。
+    const cached = await getCachedFeature(String(route.params.id)).catch(() => undefined);
+    if (cached) {
+      feature.value = cached.payload as Feature;
+      notice.value = "网络不可用，显示离线缓存数据，恢复联网后将自动更新。";
+    } else {
+      error.value = cause instanceof Error ? cause.message : "加载失败";
+    }
   } finally {
     loading.value = false;
   }

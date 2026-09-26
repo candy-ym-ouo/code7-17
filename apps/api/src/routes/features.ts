@@ -8,6 +8,7 @@ import { optionalAuth, requireAuth, requireVerifiedContributor } from "../auth";
 import { deleteObject, publicMediaUrl } from "../storage";
 import { config } from "../config";
 import { recordAudit } from "../audit";
+import { computeSyncWindow } from "../sync-cursor";
 
 type MediaRow = {
   id: string;
@@ -69,6 +70,86 @@ function bboxFromString(value: string): [number, number, number, number] {
   return [minLon, minLat, maxLon, maxLat];
 }
 
+type BboxParamIndex = { minLon: number; minLat: number; maxLon: number; maxLat: number };
+
+function bboxIntersectionSql(minLon: number, maxLon: number, idx: BboxParamIndex): string {
+  if (minLon > maxLon) {
+    return `(
+      ST_Intersects(mf.geom, ST_SetSRID(ST_MakeEnvelope($${idx.minLon}, $${idx.minLat}, 180, $${idx.maxLat}), 4326)::geography)
+      OR ST_Intersects(mf.geom, ST_SetSRID(ST_MakeEnvelope(-180, $${idx.minLat}, $${idx.maxLon}, $${idx.maxLat}), 4326)::geography)
+    )`;
+  }
+  return `ST_Intersects(mf.geom, ST_SetSRID(ST_MakeEnvelope($${idx.minLon}, $${idx.minLat}, $${idx.maxLon}, $${idx.maxLat}), 4326)::geography)`;
+}
+
+type FeatureRow = {
+  id: string;
+  category_key: string;
+  category_name: string;
+  category_icon: string | null;
+  status: string;
+  first_published_at: Date | null;
+  freshness_expires_at: Date | null;
+  needs_review_at: Date | null;
+  updated_at: Date;
+  longitude: string | number;
+  latitude: string | number;
+  payload: { title: string; description: string; condition: string; details?: unknown; tags?: unknown };
+  media: MediaRow[] | null;
+};
+
+function serializeFeatureRow(row: FeatureRow) {
+  return {
+    id: row.id,
+    categoryKey: row.category_key,
+    categoryName: row.category_name,
+    categoryIcon: row.category_icon,
+    status: row.status,
+    firstPublishedAt: row.first_published_at,
+    freshnessExpiresAt: row.freshness_expires_at,
+    needsReviewAt: row.needs_review_at,
+    updatedAt: row.updated_at,
+    longitude: Number(row.longitude),
+    latitude: Number(row.latitude),
+    title: row.payload.title,
+    description: row.payload.description,
+    condition: row.payload.condition,
+    details: row.payload.details,
+    tags: row.payload.tags,
+    media: serializeMedia(row.media)
+  };
+}
+
+const FEATURE_LIST_SELECT = `
+  SELECT
+    mf.id,
+    mf.category_key,
+    mf.status,
+    mf.first_published_at,
+    mf.freshness_expires_at,
+    mf.needs_review_at,
+    mf.updated_at,
+    ST_X(mf.geom::geometry) AS longitude,
+    ST_Y(mf.geom::geometry) AS latitude,
+    c.name AS category_name,
+    c.icon AS category_icon,
+    fr.id AS revision_id,
+    fr.payload,
+    COALESCE(
+      jsonb_agg(DISTINCT jsonb_build_object(
+        'id', ma.id,
+        'privacy_status', ma.privacy_status,
+        'public_object_key', ma.public_object_key,
+        'public_thumbnail_object_key', ma.public_thumbnail_object_key
+      )) FILTER (WHERE ma.id IS NOT NULL),
+      '[]'::jsonb
+    ) AS media
+  FROM map_features mf
+  JOIN categories c ON c.key = mf.category_key
+  JOIN feature_revisions fr ON fr.id = mf.current_revision_id
+  LEFT JOIN revision_media rm ON rm.revision_id = fr.id
+  LEFT JOIN media_assets ma ON ma.id = rm.media_id AND ma.deleted_at IS NULL`;
+
 export async function featureRoutes(app: FastifyInstance) {
   app.get("/categories", async () => {
     const result = await query(
@@ -91,16 +172,9 @@ export async function featureRoutes(app: FastifyInstance) {
     const values: unknown[] = [minLon, minLat, maxLon, maxLat, input.limit];
     const conditions = [
       "mf.status = 'published'",
-      "mf.deleted_at IS NULL"
+      "mf.deleted_at IS NULL",
+      bboxIntersectionSql(minLon, maxLon, { minLon: 1, minLat: 2, maxLon: 3, maxLat: 4 })
     ];
-    if (minLon > maxLon) {
-      conditions.push(`(
-        ST_Intersects(mf.geom, ST_SetSRID(ST_MakeEnvelope($1, $2, 180, $4), 4326)::geography)
-        OR ST_Intersects(mf.geom, ST_SetSRID(ST_MakeEnvelope(-180, $2, $3, $4), 4326)::geography)
-      )`);
-    } else {
-      conditions.push("ST_Intersects(mf.geom, ST_SetSRID(ST_MakeEnvelope($1, $2, $3, $4), 4326)::geography)");
-    }
 
     if (categories.length) {
       values.push(categories);
@@ -111,35 +185,8 @@ export async function featureRoutes(app: FastifyInstance) {
       conditions.push(`fr.payload->>'condition' = $${values.length}`);
     }
 
-    const result = await query(
-      `SELECT
-         mf.id,
-         mf.category_key,
-         mf.status,
-         mf.first_published_at,
-         mf.freshness_expires_at,
-         mf.needs_review_at,
-         mf.updated_at,
-         ST_X(mf.geom::geometry) AS longitude,
-         ST_Y(mf.geom::geometry) AS latitude,
-         c.name AS category_name,
-         c.icon AS category_icon,
-         fr.id AS revision_id,
-         fr.payload,
-         COALESCE(
-           jsonb_agg(DISTINCT jsonb_build_object(
-             'id', ma.id,
-             'privacy_status', ma.privacy_status,
-             'public_object_key', ma.public_object_key,
-             'public_thumbnail_object_key', ma.public_thumbnail_object_key
-           )) FILTER (WHERE ma.id IS NOT NULL),
-           '[]'::jsonb
-         ) AS media
-       FROM map_features mf
-       JOIN categories c ON c.key = mf.category_key
-       JOIN feature_revisions fr ON fr.id = mf.current_revision_id
-       LEFT JOIN revision_media rm ON rm.revision_id = fr.id
-       LEFT JOIN media_assets ma ON ma.id = rm.media_id AND ma.deleted_at IS NULL
+    const result = await query<FeatureRow>(
+      `${FEATURE_LIST_SELECT}
        WHERE ${conditions.join(" AND ")}
        GROUP BY mf.id, c.name, c.icon, fr.id
        ORDER BY mf.updated_at DESC
@@ -147,25 +194,79 @@ export async function featureRoutes(app: FastifyInstance) {
       values
     );
 
-    return result.rows.map((row) => ({
-      id: row.id,
-      categoryKey: row.category_key,
-      categoryName: row.category_name,
-      categoryIcon: row.category_icon,
-      status: row.status,
-      firstPublishedAt: row.first_published_at,
-      freshnessExpiresAt: row.freshness_expires_at,
-      needsReviewAt: row.needs_review_at,
-      updatedAt: row.updated_at,
-      longitude: Number(row.longitude),
-      latitude: Number(row.latitude),
-      title: row.payload.title,
-      description: row.payload.description,
-      condition: row.payload.condition,
-      details: row.payload.details,
-      tags: row.payload.tags,
-      media: serializeMedia(row.media)
-    }));
+    return result.rows.map(serializeFeatureRow);
+  });
+
+  app.get("/features/sync", async (request) => {
+    const input = z.object({
+      bbox: z.string(),
+      since: z.string().optional(),
+      limit: z.coerce.number().int().min(1).max(1000).default(500)
+    }).parse(request.query);
+
+    const [minLon, minLat, maxLon, maxLat] = bboxFromString(input.bbox);
+    let since = input.since ? new Date(input.since) : new Date(0);
+    if (Number.isNaN(since.getTime())) {
+      throw new AppError(400, "VALIDATION_FAILED", "since must be a valid ISO 8601 timestamp");
+    }
+    // 初始同步（since 为纪元或缺省）时客户端缓存为空，删除集合没有意义。
+    const initialSync = since.getTime() <= 0;
+
+    const nowResult = await query<{ now: Date }>("SELECT now() AS now");
+    const dbNow = nowResult.rows[0]!.now;
+    if (since > dbNow) since = dbNow;
+
+    const bboxSql = bboxIntersectionSql(minLon, maxLon, { minLon: 1, minLat: 2, maxLon: 3, maxLat: 4 });
+    const values: unknown[] = [minLon, minLat, maxLon, maxLat, since, dbNow, input.limit + 1];
+
+    const upsertRows = await query<FeatureRow>(
+      `${FEATURE_LIST_SELECT}
+       WHERE mf.status = 'published' AND mf.deleted_at IS NULL
+         AND mf.updated_at >= $5 AND mf.updated_at <= $6
+         AND ${bboxSql}
+       GROUP BY mf.id, c.name, c.icon, fr.id
+       ORDER BY mf.updated_at ASC, mf.id ASC
+       LIMIT $7`,
+      values
+    );
+
+    const window = computeSyncWindow(upsertRows.rows, input.limit, dbNow);
+    let serverTime = window.serverTime;
+    let hasMore = window.hasMore;
+    let deletedIds: string[] = [];
+    if (!initialSync) {
+      // 客户端需要淘汰三类记录：已删除、已下线（审核隐藏等）、位置已移出选区。
+      // 所有状态变更都会更新 updated_at，因此统一按时间窗口过滤。
+      // 取 limit + 1 检测截断：删除集合不完整时游标只能推进到已返回的
+      // 最后一条，否则未返回的删除会永久丢失。
+      const removed = await query<{ id: string; updated_at: Date }>(
+        `SELECT mf.id, mf.updated_at FROM map_features mf
+         WHERE mf.updated_at >= $5 AND mf.updated_at <= $6
+           AND (
+             (mf.deleted_at IS NOT NULL AND ${bboxSql})
+             OR (mf.deleted_at IS NULL AND mf.status != 'published' AND ${bboxSql})
+             OR (mf.deleted_at IS NULL AND mf.status = 'published' AND NOT ${bboxSql})
+           )
+         ORDER BY mf.updated_at ASC, mf.id ASC
+         LIMIT 2001`,
+        values.slice(0, 6)
+      );
+      const deletedTruncated = removed.rows.length > 2000;
+      const deletedRows = deletedTruncated ? removed.rows.slice(0, 2000) : removed.rows;
+      deletedIds = deletedRows.map((row) => row.id);
+      if (deletedTruncated) {
+        const deletedCursor = deletedRows[deletedRows.length - 1]!.updated_at;
+        if (deletedCursor < serverTime) serverTime = deletedCursor;
+        hasMore = true;
+      }
+    }
+
+    return {
+      serverTime: serverTime.toISOString(),
+      hasMore,
+      upserts: window.upserts.map(serializeFeatureRow),
+      deletedIds
+    };
   });
 
   app.get("/features/:id", { preHandler: optionalAuth }, async (request) => {

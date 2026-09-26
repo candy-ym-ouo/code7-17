@@ -1,9 +1,23 @@
 <script setup lang="ts">
+import { onBeforeUnmount, onMounted } from "vue";
 import { useRouter } from "vue-router";
 import { useAuthStore } from "./stores/auth";
+import { useOfflineStore } from "./stores/offline";
 
 const auth = useAuthStore();
+const offline = useOfflineStore();
 const router = useRouter();
+let stopAutoSync: (() => void) | null = null;
+
+onMounted(() => {
+  // 应用级自动同步：网络恢复或页面重新可见时增量同步离线区域。
+  void offline.init();
+  stopAutoSync = offline.startAutoSyncLoop();
+});
+
+onBeforeUnmount(() => {
+  stopAutoSync?.();
+});
 
 async function logout() {
   await auth.logout();

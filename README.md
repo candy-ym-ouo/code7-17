@@ -90,6 +90,15 @@ curl 'http://localhost:3000/api/v1/features?bbox=116.30,39.80,116.50,40.00'
 VITE_TILE_URL=https://tiles.example.com/{z}/{x}/{y}.png
 ```
 
+## 离线缓存
+
+前端内置离线模块（`apps/web/src/lib/offline/`），在地图页「离线区域」面板按当前视野与缩放级别范围预取瓦片和地点：
+
+- 瓦片通过 MapLibre 自定义 `offline://` 协议透明拦截：命中未过期缓存直接使用，否则网络优先、失败回退过期缓存；瓦片过期时间遵循服务端 `Cache-Control`/`Expires`。
+- 地点缓存在 IndexedDB 中，写入在单事务内比较 `updatedAt`，过期缓存不会覆盖服务端新版；离线时地图视野与详情页回退缓存并明确标注。
+- 网络恢复（`online` 事件）、页面重新可见或定时触发时，按服务端时间游标调用 `GET /features/sync` 增量同步；软删除、审核下线和移出选区的地点通过 `deletedIds` 淘汰。
+- 选区瓦片数上限 2000，大区域按 z=7 网格分块请求（每块约 2.8°，小于 5° 接口限制）；删除选区只清理不被其他选区引用的瓦片。
+
 ## 安全边界
 
 - 访问令牌短期有效，刷新令牌放在 `HttpOnly` Cookie 中并轮换。
