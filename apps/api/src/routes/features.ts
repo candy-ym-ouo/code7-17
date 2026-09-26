@@ -168,6 +168,123 @@ export async function featureRoutes(app: FastifyInstance) {
     }));
   });
 
+  app.get("/features/sync", async (request) => {
+    // 离线客户端增量同步：游标之后发生变化的已发布地点（upsert）
+    // 与被删除/审核隐藏的地点（墓碑）。
+    // 游标为不透明 ISO 时间戳；两类变更在服务端按 changed_at 归并排序，
+    // 返回 nextCursor 供翻页，直到 hasMore=false。
+    const input = z.object({
+      since: z.string().datetime({ offset: true }).optional(),
+      limit: z.coerce.number().int().min(1).max(2000).default(1000)
+    }).parse(request.query);
+
+    const since = input.since ? new Date(input.since) : null;
+    // 每类最多取 limit 条：合并后一页至多 2*limit，切片到 limit 后剩余条目
+    // 落在 nextCursor 之后，会在下一页重新取到（严格大于游标，不会丢）。
+    const queryLimit = input.limit;
+
+    const publishedResult = await query(
+      `SELECT
+         mf.id,
+         mf.category_key,
+         mf.status::text AS status,
+         mf.first_published_at,
+         mf.freshness_expires_at,
+         mf.needs_review_at,
+         mf.updated_at AS changed_at,
+         ST_X(mf.geom::geometry) AS longitude,
+         ST_Y(mf.geom::geometry) AS latitude,
+         c.name AS category_name,
+         c.icon AS category_icon,
+         fr.id AS revision_id,
+         fr.payload,
+         COALESCE(
+           jsonb_agg(DISTINCT jsonb_build_object(
+             'id', ma.id,
+             'privacy_status', ma.privacy_status,
+             'public_object_key', ma.public_object_key,
+             'public_thumbnail_object_key', ma.public_thumbnail_object_key
+           )) FILTER (WHERE ma.id IS NOT NULL),
+           '[]'::jsonb
+         ) AS media
+       FROM map_features mf
+       JOIN categories c ON c.key = mf.category_key
+       JOIN feature_revisions fr ON fr.id = mf.current_revision_id
+       LEFT JOIN revision_media rm ON rm.revision_id = fr.id
+       LEFT JOIN media_assets ma ON ma.id = rm.media_id AND ma.deleted_at IS NULL
+       WHERE mf.status = 'published'
+         AND mf.deleted_at IS NULL
+         AND ($1::timestamptz IS NULL OR mf.updated_at > $1)
+       GROUP BY mf.id, c.name, c.icon, fr.id
+       ORDER BY mf.updated_at ASC, mf.id ASC
+       LIMIT $2`,
+      [since, queryLimit]
+    );
+
+    // draft/pending/rejected 等“从未发布或回到草稿”的状态不作为墓碑：
+    // 这些内容本就不该在离线缓存里，避免作者正常修订时被误删。
+    const removedResult = await query<{ id: string; changed_at: Date }>(
+      `SELECT id, GREATEST(updated_at, COALESCE(deleted_at, updated_at)) AS changed_at
+       FROM map_features
+       WHERE $1::timestamptz IS NOT NULL
+         AND GREATEST(updated_at, COALESCE(deleted_at, updated_at)) > $1
+         AND (deleted_at IS NOT NULL OR status = 'hidden')
+       ORDER BY changed_at ASC, id ASC
+       LIMIT $2`,
+      [since, queryLimit]
+    );
+
+    type Change =
+      | { kind: "feature"; changedAt: Date; row: (typeof publishedResult.rows)[number] }
+      | { kind: "removed"; changedAt: Date; id: string };
+
+    const changes: Change[] = [
+      ...publishedResult.rows.map((row) => ({ kind: "feature" as const, changedAt: row.changed_at as Date, row })),
+      ...removedResult.rows.map((row) => ({ kind: "removed" as const, changedAt: row.changed_at, id: row.id }))
+    ].sort((a, b) => a.changedAt.getTime() - b.changedAt.getTime() ||
+      (a.kind === "feature" && b.kind === "feature"
+        ? a.row.id.localeCompare(b.row.id)
+        : a.kind.localeCompare(b.kind)));
+
+    const hasMore = changes.length > input.limit;
+    const page = changes.slice(0, input.limit);
+    const lastEntry = page[page.length - 1];
+
+    const features = page
+      .filter((entry): entry is Extract<Change, { kind: "feature" }> => entry.kind === "feature")
+      .map(({ row }) => ({
+        id: row.id,
+        categoryKey: row.category_key,
+        categoryName: row.category_name,
+        categoryIcon: row.category_icon,
+        status: row.status,
+        firstPublishedAt: row.first_published_at,
+        freshnessExpiresAt: row.freshness_expires_at,
+        needsReviewAt: row.needs_review_at,
+        updatedAt: row.changed_at,
+        longitude: Number(row.longitude),
+        latitude: Number(row.latitude),
+        title: row.payload.title,
+        description: row.payload.description,
+        condition: row.payload.condition,
+        details: row.payload.details,
+        tags: row.payload.tags,
+        media: serializeMedia(row.media)
+      }));
+
+    const removedList = page
+      .filter((entry): entry is Extract<Change, { kind: "removed" }> => entry.kind === "removed")
+      .map((entry) => ({ id: entry.id, updatedAt: entry.changedAt.toISOString() }));
+
+    return {
+      serverTime: new Date().toISOString(),
+      hasMore,
+      nextCursor: hasMore && lastEntry ? lastEntry.changedAt.toISOString() : null,
+      features,
+      removed: removedList
+    };
+  });
+
   app.get("/features/:id", { preHandler: optionalAuth }, async (request) => {
     const input = z.object({ id: z.string().uuid() }).parse(request.params);
     const result = await query(

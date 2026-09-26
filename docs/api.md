@@ -14,11 +14,32 @@
 |---|---|---|
 | `GET` | `/categories` | 分类与详情 schema |
 | `GET` | `/features?bbox=...` | 查询已发布地图要素 |
+| `GET` | `/features/sync?since=...` | 离线增量同步：变更地点与删除墓碑 |
 | `GET` | `/features/:id` | 已发布详情；作者和审核员可查看私有状态 |
 | `GET` | `/features/:id/comments` | 已发布评论 |
 | `GET` | `/features/:id/confirmations` | 时效确认汇总 |
 | `GET` | `/health/live` | 进程存活 |
 | `GET` | `/health/ready` | 数据库就绪 |
+
+### 离线增量同步
+
+`GET /api/v1/features/sync`
+
+- 首次请求不传 `since`，服务端返回全部已发布地点；之后传上一页返回的 `nextCursor`（或最终的 `serverTime`，均为 ISO-8601）。
+- `features`：游标之后新增或更新的已发布地点，结构与 `/features` 列表项一致。
+- `removed`：被软删除或审核隐藏（`hidden`）的地点墓碑 `{ id, updatedAt }`。回到草稿/待审的内容不出现在墓碑中。
+- 分页：`hasMore=true` 时用同一 `limit` 和 `nextCursor` 继续拉取；同一时间戳的行可能跨页重复，客户端必须按 `updatedAt` 幂等去重。
+- 客户端合并规则：仅当传入记录的 `updatedAt` 新于本地时才覆盖；本地墓碑不旧时不得让地点“复活”；旧的删除消息不得删除较新的地点。
+
+```json
+{
+  "serverTime": "2026-03-01T00:00:00.000Z",
+  "hasMore": false,
+  "nextCursor": null,
+  "features": [/* Feature 列表项 */],
+  "removed": [{ "id": "uuid", "updatedAt": "2026-02-01T00:00:00.000Z" }]
+}
+```
 
 ## 账号接口
 

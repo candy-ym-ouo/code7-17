@@ -104,6 +104,11 @@ button { cursor: pointer; }
   border-radius: 14px; box-shadow: var(--shadow); backdrop-filter: blur(10px);
 }
 .map-toolbar select { border: 1px solid var(--line); border-radius: 9px; padding: 7px 9px; }
+.offline-banner {
+  position: absolute; z-index: 6; top: 14px; right: 14px; max-width: 320px;
+  padding: 10px 12px; background: #fffbeb; border: 1px solid #fcd34d; color: #92400e;
+  border-radius: 12px; box-shadow: var(--shadow); font-size: 13px; line-height: 1.5;
+}
 .result-panel { overflow: auto; max-height: calc(100vh - 132px); }
 .result-item { padding: 14px 16px; border-bottom: 1px solid var(--line); display: grid; gap: 6px; }
 .result-item:hover { background: #f7fbfa; }
